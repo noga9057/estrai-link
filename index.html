@@ -93,8 +93,13 @@ $("btnLogin").onclick = () => {
     callback: async resp => {
       if (resp.error) { log("Errore login: " + resp.error); return; }
       token = resp.access_token;
-      log("Connesso a Gmail.");
-      await loadLabels();
+      log("Connesso a Gmail. Carico le etichette…");
+      try {
+        await loadLabels();
+      } catch (e) {
+        log("ERRORE nel caricare le etichette: " + e.message);
+        alert("Errore nel caricare le etichette: " + e.message);
+      }
     },
   });
   tokenClient.requestAccessToken({ prompt: "" });
@@ -106,7 +111,9 @@ async function api(path, tries = 4) {
     if (r.ok) return r.json();
     if (r.status === 401) throw new Error("Sessione scaduta: premi di nuovo \"Accedi con Google\".");
     if (r.status === 429 || r.status >= 500) { await new Promise(s => setTimeout(s, 800 * (i + 1))); continue; }
-    throw new Error("Errore Gmail " + r.status);
+    let detail = "";
+    try { const j = await r.json(); detail = (j.error && j.error.message) ? " - " + j.error.message : ""; } catch (e) {}
+    throw new Error("Errore Gmail " + r.status + detail);
   }
   throw new Error("Gmail non risponde, riprova piu' tardi.");
 }
