@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Estrai Link Gmail</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1b1f; --muted:#6b6b76; --card:#f3f3f6; --accent:#1a73e8; --border:#d9d9e0; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16161a; --fg:#ececf1; --muted:#9a9aa6; --card:#232329; --accent:#6ea8ff; --border:#34343c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; padding-top:max(16px, env(safe-area-inset-top)); padding-bottom:max(16px, env(safe-area-inset-bottom));
+         font-family:-apple-system, system-ui, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:640px; margin:0 auto; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  p.sub { margin:0 0 16px; color:var(--muted); font-size:.9rem; }
+  .card { background:var(--card); border-radius:14px; padding:14px; margin-bottom:12px; }
+  label { display:block; font-size:.85rem; color:var(--muted); margin:8px 0 4px; }
+  input[type=text], input[type=number], select {
+    width:100%; padding:12px; font-size:16px; border:1px solid var(--border); border-radius:10px; background:var(--bg); color:var(--fg); }
+  .row { display:flex; align-items:center; gap:8px; margin-top:10px; font-size:.95rem; }
+  button { width:100%; padding:14px; font-size:1rem; font-weight:600; border:0; border-radius:12px;
+           background:var(--accent); color:#fff; margin-top:10px; }
+  button:disabled { opacity:.45; }
+  button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  progress { width:100%; height:10px; margin-top:12px; }
+  #log { font-size:.8rem; color:var(--muted); white-space:pre-wrap; max-height:160px; overflow:auto; margin-top:8px; }
+  .scroll { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:.8rem; }
+  td, th { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); white-space:nowrap; max-width:260px; overflow:hidden; text-overflow:ellipsis; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Estrai Link Gmail</h1>
+  <p class="sub">Legge le email di un'etichetta, estrae i link, toglie i doppioni e crea un Excel.</p>
+
+  <div class="card">
+    <label for="clientId">Google Client ID (si inserisce una volta sola)</label>
+    <input type="text" id="clientId" placeholder="123456-abc.apps.googleusercontent.com" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <button id="btnLogin">1. Accedi con Google</button>
+  </div>
+
+  <div class="card">
+    <label for="labelSel">Etichetta</label>
+    <select id="labelSel" disabled><option>— prima accedi —</option></select>
+
+    <label for="limit">Ultime N email (0 = tutte)</label>
+    <input type="number" id="limit" value="0" min="0" inputmode="numeric">
+
+    <div class="row"><input type="checkbox" id="skipImg" checked><label for="skipImg" style="margin:0;color:inherit">Escludi link a immagini (.jpg, .png…)</label></div>
+
+    <button id="btnRun" disabled>2. Estrai i link</button>
+    <progress id="bar" class="hidden" value="0" max="1"></progress>
+    <div id="log"></div>
+  </div>
+
+  <div class="card hidden" id="resultCard">
+    <strong id="summary"></strong>
+    <button id="btnDownload">Scarica Excel</button>
+    <div class="scroll" style="margin-top:12px"><table id="preview"></table></div>
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+const SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+const API = "https://gmail.googleapis.com/gmail/v1/users/me";
+const URL_RE = /https?:\/\/[^\s<>"')\]]+/gi;
+const IMG_RE = /\.(jpe?g|png|gif|webp|svg|bmp)(\?.*)?$/i;
+const TRAIL = /[.,;:!?)\]}>"'*]+$/;
+
+const $ = id => document.getElementById(id);
+let token = null, tokenClient = null, rows = [], labels = {};
+
+// --- Client ID ricordato sul dispositivo (se lo storage non e' disponibile, si reinserisce)
+try { $("clientId").value = localStorage.getItem("gmail_client_id") || ""; } catch (e) {}
+
+function log(msg) { const el = $("log"); el.textContent += msg + "\n"; el.scrollTop = el.scrollHeight; }
+
+// --- Login
+$("btnLogin").onclick = () => {
+  const id = $("clientId").value.trim();
+  if (!id) { alert("Inserisci il Client ID."); return; }
+  try { localStorage.setItem("gmail_client_id", id); } catch (e) {}
+  if (!window.google || !google.accounts) { alert("Libreria Google non ancora caricata, riprova tra un attimo."); return; }
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: id,
+    scope: SCOPE,
+    callback: async resp => {
+      if (resp.error) { log("Errore login: " + resp.error); return; }
+      token = resp.access_token;
+      log("Connesso a Gmail.");
+      await loadLabels();
+    },
+  });
+  tokenClient.requestAccessToken({ prompt: "" });
+};
+
+async function api(path, tries = 4) {
+  for (let i = 0; i < tries; i++) {
+    const r = await fetch(API + path, { headers: { Authorization: "Bearer " + token } });
+    if (r.ok) return r.json();
+    if (r.status === 401) throw new Error("Sessione scaduta: premi di nuovo \"Accedi con Google\".");
+    if (r.status === 429 || r.status >= 500) { await new Promise(s => setTimeout(s, 800 * (i + 1))); continue; }
+    throw new Error("Errore Gmail " + r.status);
+  }
+  throw new Error("Gmail non risponde, riprova piu' tardi.");
+}
+
+async function loadLabels() {
+  const data = await api("/labels");
+  const list = (data.labels || []).sort((a, b) => a.name.localeCompare(b.name, "it"));
+  labels = {};
+  const sel = $("labelSel");
+  sel.innerHTML = "";
+  list.forEach(l => { labels[l.name] = l.id; const o = document.createElement("option"); o.textContent = l.name; sel.appendChild(o); });
+  sel.disabled = false;
+  $("btnRun").disabled = false;
+  log("Etichette trovate: " + list.length);
+}
+
+// --- Parsing messaggi
+function b64urlToText(data) {
+  const bin = atob(data.replace(/-/g, "+").replace(/_/g, "/"));
+  const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+  return new TextDecoder("utf-8").decode(bytes);
+}
+function decodeEntities(s) { const t = document.createElement("textarea"); t.innerHTML = s; return t.value; }
+
+function collectText(part, out) {
+  if ((part.mimeType === "text/plain" || part.mimeType === "text/html") && part.body && part.body.data) {
+    out.push(b64urlToText(part.body.data));
+  }
+  (part.parts || []).forEach(p => collectText(p, out));
+}
+function header(msg, name) {
+  const h = (msg.payload.headers || []).find(x => x.name.toLowerCase() === name.toLowerCase());
+  return h ? h.value : "";
+}
+
+async function listIds(labelId) {
+  let ids = [], pageToken = "";
+  do {
+    const d = await api("/messages?labelIds=" + encodeURIComponent(labelId) + "&maxResults=500" + (pageToken ? "&pageToken=" + pageToken : ""));
+    ids = ids.concat((d.messages || []).map(m => m.id));
+    pageToken = d.nextPageToken || "";
+  } while (pageToken);
+  return ids; // dalla piu' recente
+}
+
+// --- Estrazione
+$("btnRun").onclick = async () => {
+  const labelId = labels[$("labelSel").value];
+  const limit = Math.max(0, parseInt($("limit").value || "0", 10));
+  const skipImg = $("skipImg").checked;
+  $("btnRun").disabled = true; $("resultCard").classList.add("hidden");
+  const bar = $("bar"); bar.classList.remove("hidden"); bar.value = 0;
+  let wakeLock = null, skipped = 0;
+  try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+
+  try {
+    log("Recupero l'elenco dei messaggi…");
+    let ids = await listIds(labelId);
+    if (limit) ids = ids.slice(0, limit);
+    bar.max = ids.length || 1;
+    log("Messaggi da leggere: " + ids.length);
+
+    const perMsg = new Array(ids.length);
+    let next = 0, done = 0;
+    async function worker() {
+      while (next < ids.length) {
+        const i = next++;
+        try {
+          const msg = await api("/messages/" + ids[i] + "?format=full");
+          const texts = []; collectText(msg.payload, texts);
+          const found = [];
+          texts.forEach(t => (t.match(URL_RE) || []).forEach(u => found.push(decodeEntities(u).replace(TRAIL, ""))));
+          perMsg[i] = { urls: found, subject: header(msg, "Subject"), date: header(msg, "Date"), from: header(msg, "From") };
+        } catch (e) { perMsg[i] = null; skipped++; log("! messaggio saltato: " + e.message); }
+        bar.value = ++done;
+      }
+    }
+    await Promise.all([1, 2, 3, 4, 5].map(worker));
+
+    const seen = new Set(); rows = []; let total = 0;
+    perMsg.forEach(m => {
+      if (!m) return;
+      m.urls.forEach(u => {
+        if (skipImg && IMG_RE.test(u)) return;
+        total++;
+        if (seen.has(u)) return;
+        seen.add(u);
+        rows.push([u, m.subject, m.date, m.from]);
+      });
+    });
+
+    $("summary").textContent = rows.length + " link unici (su " + total + " trovati)" +
+      (skipped ? " - " + skipped + " email non lette, riprova" : "");
+    const tbl = $("preview");
+    tbl.innerHTML = "<tr><th>Link</th><th>Oggetto</th></tr>";
+    rows.slice(0, 30).forEach(r => {
+      const tr = document.createElement("tr");
+      [r[0], r[1]].forEach(v => { const td = document.createElement("td"); td.textContent = v; tr.appendChild(td); });
+      tbl.appendChild(tr);
+    });
+    $("resultCard").classList.remove("hidden");
+    log("Fatto.");
+  } catch (e) {
+    log("ERRORE: " + e.message); alert(e.message);
+  } finally {
+    $("btnRun").disabled = false;
+    try { if (wakeLock) await wakeLock.release(); } catch (e) {}
+  }
+};
+
+// --- Excel
+$("btnDownload").onclick = () => {
+  const ws = XLSX.utils.aoa_to_sheet([["Link", "Oggetto email", "Data", "Da"], ...rows]);
+  ws["!cols"] = [{ wch: 95 }, { wch: 55 }, { wch: 32 }, { wch: 35 }];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Link");
+  XLSX.writeFile(wb, "link_gmail.xlsx");
+};
+</script>
+</body>
+</html>
