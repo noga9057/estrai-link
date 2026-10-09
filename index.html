@@ -105,17 +105,37 @@ $("btnLogin").onclick = () => {
   tokenClient.requestAccessToken({ prompt: "" });
 };
 
-async function api(path, tries = 4) {
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Ritmo costante di richieste + pausa condivisa quando Gmail segnala il limite al minuto
+let pauseUntil = 0, lastCall = 0;
+const MIN_GAP = 300; // ms tra una richiesta e la successiva (circa 3 al secondo in totale)
+async function gate() {
+  while (true) {
+    const now = Date.now();
+    const start = Math.max(now, pauseUntil, lastCall + MIN_GAP);
+    if (start <= now) { lastCall = now; return; }
+    await sleep(start - now);
+  }
+}
+
+async function api(path, tries = 8) {
   for (let i = 0; i < tries; i++) {
+    await gate();
     const r = await fetch(API + path, { headers: { Authorization: "Bearer " + token } });
     if (r.ok) return r.json();
     if (r.status === 401) throw new Error("Sessione scaduta: premi di nuovo \"Accedi con Google\".");
-    if (r.status === 429 || r.status >= 500) { await new Promise(s => setTimeout(s, 800 * (i + 1))); continue; }
     let detail = "";
     try { const j = await r.json(); detail = (j.error && j.error.message) ? " - " + j.error.message : ""; } catch (e) {}
+    const limited = r.status === 429 || (r.status === 403 && /rate|quota|limit/i.test(detail));
+    if (limited && i < tries - 1) {
+      if (Date.now() >= pauseUntil) log("Limite di Gmail raggiunto: pausa di 1 minuto, poi riprendo...");
+      pauseUntil = Math.max(pauseUntil, Date.now() + 65000);
+      continue;
+    }
+    if (r.status >= 500 && i < tries - 1) { await sleep(1000 * Math.pow(2, Math.min(i, 4))); continue; }
     throw new Error("Errore Gmail " + r.status + detail);
   }
-  throw new Error("Gmail non risponde, riprova piu' tardi.");
 }
 
 async function loadLabels() {
@@ -176,22 +196,36 @@ $("btnRun").onclick = async () => {
     bar.max = ids.length || 1;
     log("Messaggi da leggere: " + ids.length);
 
-    const perMsg = new Array(ids.length);
-    let next = 0, done = 0;
-    async function worker() {
-      while (next < ids.length) {
-        const i = next++;
-        try {
-          const msg = await api("/messages/" + ids[i] + "?format=full");
-          const texts = []; collectText(msg.payload, texts);
-          const found = [];
-          texts.forEach(t => (t.match(URL_RE) || []).forEach(u => found.push(decodeEntities(u).replace(TRAIL, ""))));
-          perMsg[i] = { urls: found, subject: header(msg, "Subject"), date: header(msg, "Date"), from: header(msg, "From") };
-        } catch (e) { perMsg[i] = null; skipped++; log("! messaggio saltato: " + e.message); }
-        bar.value = ++done;
-      }
+    const perMsg = new Array(ids.length).fill(null);
+    let done = 0;
+    async function readOne(i) {
+      const msg = await api("/messages/" + ids[i] + "?format=full");
+      const texts = []; collectText(msg.payload, texts);
+      const found = [];
+      texts.forEach(t => (t.match(URL_RE) || []).forEach(u => found.push(decodeEntities(u).replace(TRAIL, ""))));
+      perMsg[i] = { urls: found, subject: header(msg, "Subject"), date: header(msg, "Date"), from: header(msg, "From") };
     }
-    await Promise.all([1, 2, 3, 4, 5].map(worker));
+    async function runPass(indexes, workers) {
+      let next = 0;
+      async function worker() {
+        while (next < indexes.length) {
+          const i = indexes[next++];
+          try { await readOne(i); } catch (e) { perMsg[i] = null; if (/Sessione scaduta/.test(e.message)) throw e; log("! email saltata: " + e.message); }
+          if (perMsg[i]) bar.value = ++done;
+        }
+      }
+      await Promise.all(Array.from({ length: workers }, worker));
+    }
+
+    await runPass(ids.map((_, i) => i), 3);
+    for (let pass = 1; pass <= 3; pass++) {
+      const missing = perMsg.map((m, i) => m ? -1 : i).filter(i => i >= 0);
+      if (!missing.length) break;
+      log("Riprovo " + missing.length + " email non lette (giro " + pass + ")...");
+      await sleep(2000 * pass);
+      await runPass(missing, 1);
+    }
+    skipped = perMsg.filter(m => !m).length;
 
     const seen = new Set(); rows = []; let total = 0;
     perMsg.forEach(m => {
