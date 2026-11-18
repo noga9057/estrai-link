@@ -29,6 +29,7 @@
   .scroll { overflow-x:auto; }
   table { border-collapse:collapse; width:100%; font-size:.8rem; }
   td, th { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); white-space:nowrap; max-width:260px; overflow:hidden; text-overflow:ellipsis; }
+  a { color:var(--accent); }
   .hidden { display:none; }
 </style>
 </head>
@@ -60,6 +61,7 @@
   <div class="card hidden" id="resultCard">
     <strong id="summary"></strong>
     <button id="btnDownload">Scarica Excel</button>
+    <button class="secondary hidden" id="btnShowAll">Mostra tutti i link</button>
     <div class="scroll" style="margin-top:12px"><table id="preview"></table></div>
   </div>
 </main>
@@ -241,13 +243,7 @@ $("btnRun").onclick = async () => {
 
     $("summary").textContent = rows.length + " link unici (su " + total + " trovati)" +
       (skipped ? " - " + skipped + " email non lette, riprova" : "");
-    const tbl = $("preview");
-    tbl.innerHTML = "<tr><th>Link</th><th>Oggetto</th></tr>";
-    rows.slice(0, 30).forEach(r => {
-      const tr = document.createElement("tr");
-      [r[0], r[1]].forEach(v => { const td = document.createElement("td"); td.textContent = v; tr.appendChild(td); });
-      tbl.appendChild(tr);
-    });
+    renderPreview(false);
     $("resultCard").classList.remove("hidden");
     log("Fatto.");
   } catch (e) {
@@ -258,10 +254,35 @@ $("btnRun").onclick = async () => {
   }
 };
 
+// --- Anteprima con link cliccabili
+function renderPreview(all) {
+  const tbl = $("preview");
+  tbl.innerHTML = "<tr><th>Link</th><th>Oggetto</th></tr>";
+  const list = all ? rows : rows.slice(0, 30);
+  list.forEach(r => {
+    const tr = document.createElement("tr");
+    const tdLink = document.createElement("td");
+    const a = document.createElement("a");
+    a.href = r[0]; a.textContent = r[0]; a.target = "_blank"; a.rel = "noopener noreferrer";
+    tdLink.appendChild(a);
+    const tdSubj = document.createElement("td");
+    tdSubj.textContent = r[1];
+    tr.appendChild(tdLink); tr.appendChild(tdSubj);
+    tbl.appendChild(tr);
+  });
+  const more = $("btnShowAll");
+  more.classList.toggle("hidden", all || rows.length <= 30);
+}
+$("btnShowAll").onclick = () => renderPreview(true);
+
 // --- Excel
 $("btnDownload").onclick = () => {
   const ws = XLSX.utils.aoa_to_sheet([["Link", "Oggetto email", "Data", "Da"], ...rows]);
   ws["!cols"] = [{ wch: 95 }, { wch: 55 }, { wch: 32 }, { wch: 35 }];
+  rows.forEach((r, i) => {
+    const cell = ws["A" + (i + 2)];
+    if (cell && r[0].length <= 2000) cell.l = { Target: r[0], Tooltip: "Apri il link" };
+  });
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Link");
   XLSX.writeFile(wb, "link_gmail.xlsx");
